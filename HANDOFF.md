@@ -153,8 +153,8 @@ AND検索は「クエリの各 bi-gram がその文書のどこかに存在す�
 ### SQLite永続化（テーブル設計）
 ```sql
 docs     (id INTEGER PRIMARY KEY, title TEXT, body TEXT, len INTEGER)
-postings (term TEXT, doc_id INTEGER, pos INTEGER)
-         -- 出現ごとに1行。idx_postings_term / idx_postings_term_doc に索引あり
+postings (term TEXT, doc_id INTEGER, pos INTEGER, UNIQUE(term, doc_id, pos))
+         -- 出現ごとに1行
 meta     (key TEXT PRIMARY KEY, value TEXT)       -- N, total_len を保存
 ```
 - **2026-08-09 にスキーマ変更**: `tf` カラムを廃止し `pos`（出現位置）に変更、
@@ -165,9 +165,15 @@ meta     (key TEXT PRIMARY KEY, value TEXT)       -- N, total_len を保存
   1行1出現にしたことで `tf` も `df` と同じ理屈で導出できるようになった
 - `M.save(idx, path)` は毎回 `DELETE FROM docs/postings/meta` してから全件 INSERT
   する「全置き換え」方式。差分更新ではない
-- **注意**: 既存の `search.db`（旧スキーマ・`tf`カラムあり）がある状態で新コードを使うと、
-  `ensure_schema` は `CREATE TABLE IF NOT EXISTS` なので既存テーブルの列は変わらない。
-  `rm -f search.db` してから `build_index.lua` を再実行すること
+- **2026-08-09 に `UNIQUE(term, doc_id, pos)` を追加**（同じ出現の二重登録を防ぐ）。
+  この複合UNIQUE制約が自動でB-tree索引を張るため、以前個別に作っていた
+  `idx_postings_term`（term単体）と `idx_postings_term_doc`（term, doc_id）は
+  左端一致（leftmost prefix）で完全にカバーされ冗長になった → 削除して整理した。
+  実際に張られる索引名は `sqlite_autoindex_postings_1`（`lua5.4 -e` で
+  `sqlite_master` を見て確認済み）
+- **注意（旧スキーマからの移行）**: 既存の `search.db` があると `ensure_schema` は
+  `CREATE TABLE IF NOT EXISTS` なので、列や UNIQUE 制約は自動更新されない。
+  スキーマを変更したら毎回 `rm -f search.db` してから `build_index.lua` を再実行すること
 
 ## 永続化の動作確認（2026-08-09 完了）
 以前は claude.ai サンドボックスに `lsqlite3` を入れられず `M.save`/`M.load` が未実行だったが、
@@ -195,8 +201,8 @@ wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/darki/Documents/VScode/lua/claude
 4. ~~posting list を doc_id でソートしAND検索（マージアルゴリズム）を実装~~
    → **完了（`M.search_and`。設計の項を参照）**
 5. `luasocket` でクローラを書いて実データを取り込む
-6. postings に `UNIQUE(term, doc_id)` 制約を追加
-   → 1行1出現のスキーマになったので、正確には `UNIQUE(term, doc_id, pos)` になる想定
+6. ~~postings に `UNIQUE(term, doc_id)` 制約を追加~~
+   → **完了（`UNIQUE(term, doc_id, pos)`。SQLite永続化の項を参照）**
 
 ### フレーズ検索の残課題（着手するなら）
 - **前方一致展開と組み合わせていない**。`"Lua"` でのフレーズ検索は `luajit` を含まない

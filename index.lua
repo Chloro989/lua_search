@@ -607,12 +607,19 @@ end
 -- テーブル設計:
 --   docs     (id, title, body, len)         -- 文書本体と長さ
 --   postings (term, doc_id, pos)            -- 出現ごとに1行（フレーズ検索用の位置情報）
+--            UNIQUE(term, doc_id, pos) が付いており、同じ出現の二重登録を防ぐ
 --   meta     (key, value)                   -- N, total_len
 --
 -- df（何文書に含まれるか）と tf（文書内の出現回数）はあえて保存しない。
 -- postings から COUNT(DISTINCT doc_id) / COUNT(*) で復元できるものを
 -- 別テーブルや別カラムに二重管理すると、更新のたびに同期がズレる危険があるため。
 -- これは1行1出現にしたことで tf も df と同じ理屈で導出できるようになった。
+--
+-- 索引について: UNIQUE(term, doc_id, pos) は SQLite が自動でこの3列複合の
+-- 索引を作る。B-treeは左端一致（leftmost prefix）で使えるので、
+-- 「term だけで検索」「term と doc_id で検索」のどちらもこの1本の索引で
+-- まかなえる。以前あった idx_postings_term / idx_postings_term_doc という
+-- 別々の索引は冗長になったため、この UNIQUE 制約の追加を機に整理した。
 
 local sqlite3 = require("lsqlite3")
 
@@ -636,14 +643,9 @@ local function ensure_schema(db)
     CREATE TABLE IF NOT EXISTS postings (
       term   TEXT NOT NULL,
       doc_id INTEGER NOT NULL,
-      pos    INTEGER NOT NULL
+      pos    INTEGER NOT NULL,
+      UNIQUE(term, doc_id, pos)
     );
-
-    CREATE INDEX IF NOT EXISTS idx_postings_term
-      ON postings(term);
-
-    CREATE INDEX IF NOT EXISTS idx_postings_term_doc
-      ON postings(term, doc_id);
 
     CREATE TABLE IF NOT EXISTS meta (
       key   TEXT PRIMARY KEY,
