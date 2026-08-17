@@ -2,7 +2,8 @@
 --
 -- 使い方: lua5.4 crawler.lua
 --   1. urls.txt (1行1URL、# で始まる行はコメント) を読み込む
---   2. socket.http で順番に取得する（サーバへの配慮として1リクエストごとに間隔をあける）
+--   2. http:// / https:// 両対応で順番に取得する
+--      （サーバへの配慮として1リクエストごとに間隔をあける）
 --   3. <title> とタグを除去した本文をインデックスに追加する
 --   4. crawled.db に保存する（build_index.lua が作る search.db とは別ファイル）
 --
@@ -10,11 +11,14 @@
 -- 自動的に対象を広げる、いわゆる本格的なクロールはしない
 -- （対象サイトへの意図しない大量アクセスを避けるための設計判断）。
 --
--- 既知の制約: このリポジトリの実行環境では luasec (ssl.https) が
--- luasocket とバージョン非互換で HTTPS が使えない状態だった
--- （HANDOFF.md 参照）。そのため今のところ http:// のURLのみ対応。
--- https:// を渡すとエラーになる。
+-- 以前ここに「luasec が luasocket とバージョン非互換でHTTPSが使えない」
+-- という制約を書いていたが、2026-08-17 に環境側を修正して解消した
+-- （apt版 luasec と luarocks版 luasocket が別系統でABIが噛み合っていなかった。
+--  libssl-dev を入れてから `sudo luarocks install luasec` で
+--  luasocket と同じ luarocks 系統に揃えて解決。詳細は HANDOFF.md）。
 local http   = require("socket.http")
+local https  = require("ssl.https")
+local ltn12  = require("ltn12")
 local socket = require("socket")
 local Index  = require("index")
 
@@ -34,15 +38,29 @@ local function read_urls(path)
   return urls
 end
 
+-- http:// と https:// の両方に対応する。テーブル形式のリクエストにすると
+-- User-Agent ヘッダーを付けられる（対象サイトに「何者からのアクセスか」を
+-- 名乗るのが礼儀のため）。
 local function fetch(url)
-  if not url:match("^http://") then
-    return nil, "https:// は現状未対応です（HANDOFF.md 参照）。http:// のURLを使ってください"
+  local request
+  if url:match("^https://") then
+    request = https.request
+  elseif url:match("^http://") then
+    request = http.request
+  else
+    return nil, "http:// または https:// で始まるURLではありません"
   end
-  local body, code, _, status = http.request(url)
-  if not body or code ~= 200 then
+
+  local response = {}
+  local ok, code, _, status = request{
+    url     = url,
+    sink    = ltn12.sink.table(response),
+    headers = { ["User-Agent"] = USER_AGENT },
+  }
+  if not ok or code ~= 200 then
     return nil, string.format("HTTP %s", tostring(code or status))
   end
-  return body
+  return table.concat(response)
 end
 
 --------------------------------------------------------------------
@@ -51,8 +69,20 @@ end
 -- （学習用途として割り切り。壊れたHTMLやコメント内のタグっぽい文字列などで
 --  誤動作する可能性はある）。
 --------------------------------------------------------------------
+-- Luaの文字列パターンには大文字小文字を区別しないマッチが無いので、
+-- タグ名の各アルファベットを [Aa] のような文字クラスに展開して代用する。
+-- lua.org の一部ページ（about.html など）が <TITLE>（大文字）で
+-- タグを書いており、<title> 決め打ちだと拾えなかったための対策。
+local function ci(tag)
+  return (tag:gsub("%a", function(c) return "[" .. c:lower() .. c:upper() .. "]" end))
+end
+
+local TITLE_PATTERN  = ci("<title") .. "[^>]*>(.-)" .. ci("</title>")
+local SCRIPT_PATTERN = ci("<script") .. ".-" .. ci("</script>")
+local STYLE_PATTERN  = ci("<style") .. ".-" .. ci("</style>")
+
 local function extract_title(html)
-  local t = html:match("<title[^>]*>(.-)</title>")
+  local t = html:match(TITLE_PATTERN)
   if not t then return "" end
   return t:gsub("%s+", " "):match("^%s*(.-)%s*$")
 end
@@ -68,10 +98,10 @@ end
 
 local function extract_body_text(html)
   local s = html
-  s = s:gsub("<script.-</script>", " ")
-  s = s:gsub("<style.-</style>", " ")
+  s = s:gsub(SCRIPT_PATTERN, " ")
+  s = s:gsub(STYLE_PATTERN, " ")
   s = s:gsub("<!%-%-.-%-%->", " ")
-  s = s:gsub("<[^>]+>", " ")   -- 残りの全タグを空白に置換
+  s = s:gsub("<[^>]+>", " ")   -- 残りの全タグを空白に置換（タグ名の大小は問わない）
   s = decode_entities(s)
   s = s:gsub("%s+", " ")
   return s:match("^%s*(.-)%s*$")
