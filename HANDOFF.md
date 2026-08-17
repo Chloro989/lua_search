@@ -12,7 +12,8 @@
 - 導入済みライブラリ（`lua5.4 -e 'print(require("X"))'` で動作確認済み）:
   - `lsqlite3` （`/usr/local/lib/lua/5.4/lsqlite3.so`）
   - `lfs` (luafilesystem) （`/usr/local/lib/lua/5.4/lfs.so`）
-  - `socket` (luasocket) （`/usr/local/share/lua/5.4/socket.lua`）
+  - `socket` (luasocket) （`/usr/local/share/lua/5.4/socket.lua`、`require` は通るが後述のHTTPS問題あり）
+  - `ssl` / `ssl.https` (luasec) （`/usr/share/lua/5.4/ssl/https.lua`、`require` は通るが**実際に使うと壊れる**。下記参照）
 - `libsqlite3-dev` も導入済み
 
 ### 環境構築でハマった点（再発時の参考）
@@ -23,6 +24,24 @@
    sudo あり/なし両方で実行するなら両方に設定するか、
    `sudo luarocks config --scope system lua_version 5.4` でシステム全体に設定する
 3. `lsqlite3` のビルド時は `sqlite3.h` が必要 → `libsqlite3-dev` を先に入れる
+4. **【未解決】luasec (HTTPS) が壊れている**（2026-08-17 発見）:
+   - `require("socket")` は通るが、実際にHTTPS URLへリクエストすると
+     `/usr/share/lua/5.4/ssl/https.lua:66: bad argument #2 to 'method'
+     (string expected, got light userdata)` で例外になる
+   - 原因: `lua-sec` (1.0.2-1) が **apt** でインストールされているのに対し、
+     実際に読み込まれる `socket`/`socket.http` は **luarocks** 版
+     （`lua-socket` apt版は `3.0~rc1+git...`、luarocks版は `LuaSocket 3.0.0` で別物）。
+     apt版 `lua-sec` はapt版 `lua-socket` を前提にビルドされているため、
+     luarocks版 `socket` と組み合わせるとC拡張のABIが噛み合わずクラッシュする
+   - `http://` の**プレーンHTTP（TLSなし）は正常に動作する**ことを確認済み
+     （`http://info.cern.ch/` でテスト成功）。**問題はHTTPSのみ**
+   - 想定される修正: `sudo luarocks install luasec` で luasec を
+     luasocket と同じ系統（luarocks）に揃えてビルドし直す
+     → **`sudo` のパスワード入力が必要で、Claude Code側からは非対話実行できず
+     試行が止まってしまった（プロセスをkillして中断）。ユーザー側の端末で
+     手動実行してもらう必要がある**
+   - 修正されるまで `crawler.lua` は `http://` のURLのみ対応（`https://` は
+     エラーを返すようガードしてある）
 
 ## ファイル一覧（`C:\Users\darki\Documents\VScode\lua\claude\`）
 - `index.lua` … 本体。トークナイザ、転置インデックス構造、BM25検索、前方一致展開、SQLite保存/読込
@@ -30,6 +49,9 @@
 - `build_index.lua` … サンプル文書からインデックスを構築し `search.db` に保存するスクリプト
 - `search_cli.lua` … `search.db` を読み込んで検索するだけの独立プロセス（永続化の動作確認用）
 - `search.db` … 生成物。`build_index.lua` を実行すると作られる（消して作り直して構わない）
+- `crawler.lua` … `urls.txt` に列挙したページを取得し `crawled.db` に保存するクローラ
+- `urls.txt` … クローラが取得するURLの一覧（1行1URL、`#`でコメント）。**現状 `http://` のみ対応**
+- `crawled.db` … 生成物。`crawler.lua` を実行すると作られる（`search.db` とは別ファイル）
 
 ## index.lua の設計判断（変更時に踏まえてほしい前提）
 
@@ -200,9 +222,31 @@ wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/darki/Documents/VScode/lua/claude
 3. ~~posting list に位置情報を持たせてフレーズ検索対応~~ → **完了（`M.search_phrase`。設計の項を参照）**
 4. ~~posting list を doc_id でソートしAND検索（マージアルゴリズム）を実装~~
    → **完了（`M.search_and`。設計の項を参照）**
-5. `luasocket` でクローラを書いて実データを取り込む
+5. ~~`luasocket` でクローラを書いて実データを取り込む~~ → **実装完了、ただし一部保留（下記）**
 6. ~~postings に `UNIQUE(term, doc_id)` 制約を追加~~
    → **完了（`UNIQUE(term, doc_id, pos)`。SQLite永続化の項を参照）**
+
+### クローラの実装状況（2026-08-17）
+`crawler.lua` / `urls.txt` を追加。`http://info.cern.ch/` で1件取得 → 抽出 → 索引化 → `crawled.db`
+保存 → `Index.search` でヒットする、という一連の流れを実機で動作確認済み。
+
+- **HTTPS未対応（環境側の未解決バグが原因）**: 上の「環境構築でハマった点」参照。
+  luasec と luasocket のインストール元（apt / luarocks）が食い違っておりHTTPSが使えない。
+  `sudo luarocks install luasec` で直る見込みだが、sudoのパスワード入力が要るため
+  Claude Code側では実行できなかった。**ユーザー側で実行してもらってから再開する**
+- 直したら `urls.txt` に `https://www.lua.org/` 配下のページ（マニュアル等、ユーザーと
+  合意済みの対象）を追加し、`crawler.lua` の `fetch()` 内の `http://` 限定ガードを外して
+  `ssl.https` 経由のリクエストに対応させる予定
+- HTMLからのテキスト抽出は正規表現によるタグ除去のみの簡易版（`<title>` 抽出、
+  `<script>`/`<style>`/コメント除去、残りのタグを空白に置換、主要なHTMLエンティティ
+  をデコード）。ちゃんとしたHTMLパーサではないので、壊れたHTMLや稀なエンティティで
+  誤動作する可能性はある
+- リンクを辿って自動的に対象を広げる「クロール」はしていない。`urls.txt` に
+  列挙したURLだけを取得する設計（対象サイトへの意図しない大量アクセスを避けるため）
+- 取得間隔は `FETCH_DELAY = 1.2` 秒（`crawler.lua` 冒頭）。User-Agentは
+  `LuaSearchEngineLearningCrawler/0.1 (+https://github.com/Chloro989/lua_search)`
+  として自己申告している
+- `lua.org` の `robots.txt` は404（存在しない）ことを事前に確認済み
 
 ### フレーズ検索の残課題（着手するなら）
 - **前方一致展開と組み合わせていない**。`"Lua"` でのフレーズ検索は `luajit` を含まない

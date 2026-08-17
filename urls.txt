@@ -1,0 +1,3 @@
+# crawler.lua が取得するURLを1行1件で列挙する。# で始まる行はコメント。
+# 現状 luasec の不具合で https:// は未対応（HANDOFF.md 参照）。http:// のみ。
+http://info.cern.ch/
