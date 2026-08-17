@@ -52,8 +52,9 @@
 - `build_index.lua` … サンプル文書からインデックスを構築し `search.db` に保存するスクリプト
 - `search_cli.lua` … `search.db` を読み込んで検索するだけの独立プロセス（永続化の動作確認用）
 - `search.db` … 生成物。`build_index.lua` を実行すると作られる（消して作り直して構わない）
-- `crawler.lua` … `urls.txt` に列挙したページを取得し `crawled.db` に保存するクローラ
-- `urls.txt` … クローラが取得するURLの一覧（1行1URL、`#`でコメント）。**現状 `http://` のみ対応**
+- `crawler.lua` … `urls.txt` を起点にリンクを辿ってBFSクロールし `crawled.db` に保存する
+- `urls.txt` … クロールの起点(シード)URLの一覧（1行1URL、`#`でコメント）。
+  http:// / https:// 両対応。ここに含まれるドメインだけがクロール対象になる
 - `crawled.db` … 生成物。`crawler.lua` を実行すると作られる（`search.db` とは別ファイル）
 
 ## index.lua の設計判断（変更時に踏まえてほしい前提）
@@ -225,49 +226,90 @@ wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/darki/Documents/VScode/lua/claude
 3. ~~posting list に位置情報を持たせてフレーズ検索対応~~ → **完了（`M.search_phrase`。設計の項を参照）**
 4. ~~posting list を doc_id でソートしAND検索（マージアルゴリズム）を実装~~
    → **完了（`M.search_and`。設計の項を参照）**
-5. ~~`luasocket` でクローラを書いて実データを取り込む~~ → **完了**
+5. ~~`luasocket` でクローラを書いて実データを取り込む~~ → **完了（本格的なリンク追跡版まで実装済み）**
 6. ~~postings に `UNIQUE(term, doc_id)` 制約を追加~~
    → **完了（`UNIQUE(term, doc_id, pos)`。SQLite永続化の項を参照）**
 
 **当初リストの6項目は全て完了。次の候補（未合意・要相談）**:
 - 前方一致展開・AND検索・フレーズ検索を組み合わせる（各項の「残課題」参照）
-- `crawler.lua` をリンク追跡型の本格的なクローラに拡張する（現状は列挙したURLのみ）
 - 文書削除・差分更新（今は `M.save` が毎回全置き換え）
 - 複数フィールド対応（title/bodyを別々に重み付けしてスコアリングする等）
+- robots.txtのワイルドカード(`*`)・末尾アンカー(`$`)対応（下記「クローラの残課題」参照）
 
-### クローラの実装状況（2026-08-17）
-`crawler.lua` / `urls.txt` を追加。`https://www.lua.org/` 配下5ページ
-（about.html, start.html, manual/5.4/manual.html, pil/1.html, pil/1.1.html）を実際に
-取得 → 抽出 → 索引化 → `crawled.db` 保存 → BM25検索・フレーズ検索・AND検索の全部で
-ヒットする、という一連の流れを実機で動作確認済み。
+### クローラの実装状況（2026-08-17、リンク追跡版に刷新）
+`crawler.lua` / `urls.txt` を、単にURLを列挙するだけの版から、
+**幅優先探索(BFS)でリンクを辿る本格的なクローラ**に刷新した。
+
+`urls.txt` を「起点(シード)」として扱い、そこに含まれるドメインだけを対象に
+ページ内の `<a href>` を辿っていく。無制限に広がらないよう、以下の5つで
+歯止めをかけている:
+1. **同一ドメイン限定**（シードのホスト名以外には広がらない）
+2. **`MAX_PAGES = 20`**（実際にHTTPリクエストを送る回数の上限）
+3. **`MAX_DEPTH = 3`**（起点からのリンク階層の上限）
+4. **robots.txt遵守**（`Disallow`/`Allow`/`Crawl-delay` を簡易パーサで解釈）
+5. **`FETCH_DELAY = 1.2`秒**（1リクエストごとの間隔。robots.txtのCrawl-delayが
+   これより長ければそちらを優先）
+
+`https://www.lua.org/start.html` を起点に実際にBFSクロールし、20ページ取得・
+リンク経由で発見した19文書のインデックス化・打ち切り時のログ出力（キューに
+残り311件、と明示。サイレントな切り捨てはしない）まで実機で動作確認済み。
+検索側（BM25・フレーズ検索・AND検索）も実データに対して正しくヒットすることを確認済み。
 
 ```
-文書数=5  異なり語数=2957
-検索(BM25) "coroutine"           → 1位 Lua 5.4 Reference Manual
-フレーズ検索 "Programming in Lua" → 1位 Programming in Lua : 1 (count=3)
-AND検索 "lua metatable"          → 1位 Lua 5.4 Reference Manual
+[1] depth=0 https://www.lua.org/start.html ... OK
+[2] depth=1 https://www.lua.org/home.html ... OK
+...
+[19] depth=2 https://www.lua.org/images/luaa.gif ... スキップ（非HTML: image/gif）
+[20] depth=2 https://www.lua.org/news.html ... OK
+MAX_PAGES(20)に達したため打ち切り。キューに残り311件あり（取得されなかった）
+文書数=19  異なり語数=3053  posting総数=6007
 ```
 
-- **HTTP/HTTPS両対応**: `fetch()` はURLのスキームで `socket.http` / `ssl.https` を
-  切り替える。どちらもテーブル形式のリクエスト（`sink` + `headers`）を使うので
-  User-Agentヘッダーを付けられる
-- **踏んだバグ**: `<title>` 抽出が最初 `<title[^>]*>(.-)</title>` という小文字決め打ち
-  パターンだったため、`about.html`/`start.html`/`manual.html` のような
-  `<TITLE>`（大文字）でタグを書く古い書式のページでタイトルが空になった。
-  Luaの文字列パターンには大文字小文字を区別しないマッチが無いため、
-  `ci(tag)` というヘルパーでタグ名の各アルファベットを `[Aa]` のような
-  文字クラスに展開して代用する形で解決（`<script>`/`<style>` の除去にも同様に適用）。
-  残りの全タグ除去 `<[^>]+>` はもともとタグ名の大小を問わないので対象外
-- HTMLからのテキスト抽出は正規表現によるタグ除去のみの簡易版（`<title>` 抽出、
-  `<script>`/`<style>`/コメント除去、残りのタグを空白に置換、主要なHTMLエンティティ
-  をデコード）。ちゃんとしたHTMLパーサではないので、上記のような大文字タグ以外にも
-  壊れたHTMLや稀なエンティティで誤動作する可能性はある
-- リンクを辿って自動的に対象を広げる「クロール」はしていない。`urls.txt` に
-  列挙したURLだけを取得する設計（対象サイトへの意図しない大量アクセスを避けるため）
-- 取得間隔は `FETCH_DELAY = 1.2` 秒（`crawler.lua` 冒頭）。User-Agentは
+#### robots.txtパーサの設計
+`parse_robots(text, agent_token)` … User-agent / Disallow / Allow / Crawl-delay の
+みに対応した簡易パーサ。Googleが独自拡張したワイルドカード(`*`)や末尾アンカー(`$`)
+には非対応（標準的なrobots.txtの大半はこれで足りるという学習用途の割り切り）。
+
+- 連続する `User-agent:` 行は同じグループとしてまとめ、`Disallow`/`Allow` が
+  1つでも出たらそこでグループが確定する（次の `User-agent:` 行で新グループ開始）
+- 自分の `ROBOTS_AGENT_TOKEN`（`USER_AGENT` からバージョン番号等を除いた名前部分）
+  に完全一致するグループを優先し、無ければ `*` のグループを使う。該当グループが
+  無ければ制限なし扱い
+- `Disallow`/`Allow` は前方一致で判定し、**最長一致したパターンが優先**（規約上の
+  一般的な解決方法。例: `Disallow: /private/` + `Allow: /private/public/` なら
+  `/private/public/x.html` は許可される）
+- `lua.org` の robots.txt は404（存在しないので常に制限なし）なので、実際のクロールでは
+  Disallow分岐が一度も通っていない。ロジック自体は合成データで単体検証済み
+  （単純Disallow、Allow上書き、UA別グループ選択、複数UA行の同一グループ化、
+  空Disallow=全許可、Crawl-delay取得、の6パターン全て期待通り）
+
+#### 実装中に踏んだバグ（2件）
+1. **`<TITLE>`（大文字）タグでタイトルが空になる**: `<title[^>]*>(.-)</title>` という
+   小文字決め打ちパターンだったため、`about.html`/`start.html`/`manual.html` のような
+   古い書式のページで抽出に失敗した。Luaの文字列パターンには大文字小文字を
+   区別しないマッチが無いため、`ci(tag)` というヘルパーでタグ名の各アルファベットを
+   `[Aa]` のような文字クラスに展開して代用する形で解決（`<script>`/`<style>`/`<a>`の
+   マッチにも同様に適用）。残りの全タグ除去 `<[^>]+>` はもともとタグ名の大小を
+   問わないので対象外
+2. **ISO-8859-1ページで文字化け**: BFSでリンクを辿って発見した `portugues.html` が
+   ISO-8859-1(Latin-1)でエンコードされており、UTF-8前提のトークナイザにそのまま
+   渡すと文字化けした（`"A Linguagem de Programa??o Lua"`のように）。ISO-8859-1は
+   1バイト=1文字で、バイト値がそのままUnicodeコードポイントと一致するという性質を
+   利用し、外部ライブラリなしで `iso8859_1_to_utf8()` を実装して解決。
+   `Content-Type`ヘッダーの`charset=`と`<meta charset>`の両方から文字コード宣言を
+   探す `detect_charset()` を用意し、ISO-8859-1/Windows-1252と判定されたページだけ
+   変換する（Windows-1252は0x80-0x9Fの範囲だけISO-8859-1と意味が異なるが、
+   本文中の出現頻度は低いため同一視する簡易実装）
+
+#### クローラの残課題（着手するなら）
+- **HTMLパーサは正規表現ベースの簡易版のまま**。`<title>`抽出・タグ除去・リンク抽出
+  （`<a href>`）全てが該当。壊れたHTMLや入れ子コメントなどで誤動作する可能性はある
+- **robots.txtのワイルドカード(`*`)・末尾アンカー(`$`)未対応**（上記参照）
+- **Windows-1252の0x80-0x9F範囲は不正確**（上記参照）。他の文字コード
+  （Shift_JIS等）は非対応
+- 取得間隔は `FETCH_DELAY = 1.2` 秒、User-Agentは
   `LuaSearchEngineLearningCrawler/0.1 (+https://github.com/Chloro989/lua_search)`
   として自己申告している
-- `lua.org` の `robots.txt` は404（存在しない）ことを事前に確認済み
 
 ### フレーズ検索の残課題（着手するなら）
 - **前方一致展開と組み合わせていない**。`"Lua"` でのフレーズ検索は `luajit` を含まない

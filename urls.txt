@@ -1,7 +1,4 @@
-# crawler.lua が取得するURLを1行1件で列挙する。# で始まる行はコメント。
+# crawler.lua がクロールを開始する起点(シード)URLを1行1件で列挙する。
+# ここに書いたURLと同じドメインのリンクだけを辿っていく（他ドメインには広がらない）。
 # lua.org の robots.txt は404（クロール制限の指定なし、2026-08-17確認済み）。
-https://www.lua.org/about.html
 https://www.lua.org/start.html
-https://www.lua.org/manual/5.4/manual.html
-https://www.lua.org/pil/1.html
-https://www.lua.org/pil/1.1.html
